@@ -110,28 +110,39 @@ def watch_rsync_command(cmd_line: List[str], ptys: Ptys) -> int:
         cmd_line, bufsize=0, stdin=ptys.s_in, stdout=ptys.s_out, stderr=ptys.s_err,
     )
 
-    timeout = 0.04  # seconds
+    # If we are currently in the state of having too low of a transfer rate
     low_rate = False
-    last_good_time = time.time()
+    # The last time we had an acceptable rate of download
+    last_acceptable_rate_time = time.time()
+    # Last non-progress line received. This should contain the filename we are
+    # currently transferring
     last_line = ""
+    # If the last line printed was a progress line or not
     last_was_progress = False
+    # Record the last time we had any activity from rsync as we will terminate
+    # it if we think it could have got stuck.
     last_activity = time.time()
 
+    timeout = 0.04  # seconds to wait for select.select
     while True:
+        # We check if any of our ptys are ready for reading. We use the timeout
+        # feature as we don't want to block forever waiting for rsync as it
+        # could hang.
         ready, _, _ = select.select([ptys.m_out, ptys.m_err], [], [], timeout)
         if ready:
             last_activity = time.time()
             for fd in ready:
                 data = os.read(fd, 512)
                 if not data:
-                    break
+                    continue
+                # Convert from bytes to str
                 temp_string = os.fsdecode(data)
                 temp_string = temp_string.strip()
-                for work_string in temp_string.splitlines():
+                for line in temp_string.splitlines():
                     if not last_was_progress:
-                        print(f"\t{fdmap[fd]}: {work_string!r}")
+                        print(f"\t{fdmap[fd]}: {line!r}")
 
-                    progress_stats = parse_progress_line(work_string)
+                    progress_stats = parse_progress_line(line)
                     if progress_stats:
                         if not last_was_progress:
                             print(last_line)
@@ -146,7 +157,7 @@ def watch_rsync_command(cmd_line: List[str], ptys: Ptys) -> int:
                             end="",
                         )
                         if progress_stats.transfer_rate > 100_000:
-                            last_good_time = time.time()
+                            last_acceptable_rate_time = time.time()
                             low_rate = False
                         else:
                             if not low_rate:
@@ -155,18 +166,21 @@ def watch_rsync_command(cmd_line: List[str], ptys: Ptys) -> int:
                                 print(
                                     "Rate is too low!!! {:2.2f} seconds".format(
                                         RATE_LOW_TIMEOUT
-                                        - (time.time() - last_good_time)
+                                        - (time.time() - last_acceptable_rate_time)
                                     )
                                 )
                                 last_was_progress = False
-                                if time.time() - last_good_time > RATE_LOW_TIMEOUT:
+                                if (
+                                    time.time() - last_acceptable_rate_time
+                                    > RATE_LOW_TIMEOUT
+                                ):
                                     print("Killing process as rate too low")
                                     process.terminate()
                     else:
-                        if work_string:
+                        if line:
                             last_was_progress = False
-                            last_line = work_string
-        elif process.poll() is not None:  # select timed-out
+                            last_line = line
+        elif process.poll() is not None:
             break  # p exited
         else:
             # If we don't have any activity for a minute we will terminate
