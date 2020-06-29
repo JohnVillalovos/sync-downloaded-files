@@ -2,17 +2,17 @@
 # vim: ai ts=4 sts=4 et sw=4
 
 # Copyright (C) 2020 John L. Villalovos (john@sodarock.com)
-# 
+#
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
-# 
+#
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
-# 
+#
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
@@ -27,7 +27,7 @@ import select
 import subprocess
 import sys
 import time
-from typing import Iterator, List, NamedTuple
+from typing import Iterator, List, NamedTuple, Optional
 
 
 locale.setlocale(locale.LC_ALL, "en_US.UTF-8")
@@ -94,6 +94,8 @@ def execute_rsync(args: argparse.Namespace) -> int:
 
 
 class Ptys(NamedTuple):
+    """The namedtuple to hold all of our ptys"""
+
     m_out: int
     s_out: int
     m_err: int
@@ -129,38 +131,21 @@ def watch_rsync_command(cmd_line: List[str], ptys: Ptys) -> int:
                     if not last_was_progress:
                         print(f"\t{fdmap[fd]}: {work_string!r}")
 
-                    # Example rsync progress line:
-                    #  823,915,288  35%   36.65MB/s    0:00:40
-                    result = re.search(
-                        r"""(?P<bytes>.*[0-9,]+)            # bytes transferred
-                            \ +                             # one or more spaces
-                            (?P<percent>[0-9.]+)%           # percent complete
-                            \ +                             # one or more spaces
-                            (?P<rate>[0-9A-Za-z.]+/s)       # current rate of transfer
-                            \ +                             # one or more spaces
-                            (?P<eta>\d+:\d\d:\d\d)          # current rate of transfer
-                            .*
-                        """,
-                        work_string,
-                        flags=re.VERBOSE,
-                    )
-                    if result:
-                        bytes_transferred = locale.atoi(result.group("bytes"))
-                        percent_transferred = float(result.group("percent"))
-                        rate = parse_rate(result.group("rate"))
-                        eta = result.group("eta")
+                    progress_stats = parse_progress_line(work_string)
+                    if progress_stats:
                         if not last_was_progress:
                             print(last_line)
                         last_was_progress = True
                         print(
                             f"\r"
-                            f"Match!: Rate: {rate:n} bytes/s, "
-                            f"Bytes Transferred: {bytes_transferred:n}, "
-                            f"Percent Transferred: {percent_transferred}%, "
-                            f"ETA: {eta}                     ",
+                            f"Match!: Rate: {progress_stats.transfer_rate:n} bytes/s, "
+                            f"Bytes Transferred: {progress_stats.bytes_transferred:n}, "
+                            f"Percent Transferred: "
+                            f"{progress_stats.percent_transferred}%, "
+                            f"ETA: {progress_stats.eta}                     ",
                             end="",
                         )
-                        if rate > 100_000:
+                        if progress_stats.transfer_rate > 100_000:
                             last_good_time = time.time()
                             low_rate = False
                         else:
@@ -295,6 +280,49 @@ def pty_open() -> Iterator[Ptys]:
     finally:
         for fd in m_out, s_out, m_err, s_err, m_in, s_in:
             os.close(fd)
+
+
+class RsyncProgressStatus(NamedTuple):
+    bytes_transferred: int
+    percent_transferred: float
+    transfer_rate: int
+    eta: str
+
+
+def parse_progress_line(line: str) -> Optional[RsyncProgressStatus]:
+    """
+    Attempt to parse an rsync progress line into values.
+
+    Either returns the values or None if not a progress line.
+    """
+    # Example rsync progress line:
+    #  823,915,288  35%   36.65MB/s    0:00:40
+    result = re.search(
+        r"""(?P<bytes>.*[0-9,]+)            # bytes transferred
+            \ +                             # one or more spaces
+            (?P<percent>[0-9.]+)%           # percent complete
+            \ +                             # one or more spaces
+            (?P<rate>[0-9A-Za-z.]+/s)       # current rate of transfer
+            \ +                             # one or more spaces
+            (?P<eta>\d+:\d\d:\d\d)          # current rate of transfer
+            .*
+        """,
+        line,
+        flags=re.VERBOSE,
+    )
+    if not result:
+        return None
+
+    bytes_transferred = locale.atoi(result.group("bytes"))
+    percent_transferred = float(result.group("percent"))
+    transfer_rate = parse_rate(result.group("rate"))
+    eta = result.group("eta")
+    return RsyncProgressStatus(
+        bytes_transferred=bytes_transferred,
+        percent_transferred=percent_transferred,
+        transfer_rate=transfer_rate,
+        eta=eta,
+    )
 
 
 if "__main__" == __name__:
