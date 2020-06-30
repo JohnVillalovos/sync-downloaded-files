@@ -44,8 +44,6 @@ def main() -> int:
 
 
 def execute_rsync(args: argparse.Namespace) -> int:
-    dest_path = args.dest_dir
-
     cmd_list = []
 
     cmd_list.extend(
@@ -72,12 +70,12 @@ def execute_rsync(args: argparse.Namespace) -> int:
     if args.bwlimit:
         cmd_list.extend(["--bwlimit", args.bwlimit])
     cmd_list.extend(["--exclude", "*.part"])
-    cmd_list.extend(["{}:{}".format(args.server, args.server_path), dest_path])
+    cmd_list.extend(["{}:{}".format(args.server, args.server_path), args.dest_dir])
 
     with pty_open() as ptys:
         while True:
             print("Syncing from {}...".format(args.server))
-            print("To: {}".format(dest_path))
+            print("To: {}".format(args.dest_dir))
             print("Executing: {}".format(" ".join(cmd_list)))
             try:
                 run_rsync_command(cmd_list, ptys)
