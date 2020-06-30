@@ -270,6 +270,9 @@ def print_progress(
 
 
 def parse_rate(rate_string: str) -> int:
+    # We are expecting an input like one of these:
+    #   6.8MB/s
+    #   32.4kB/s
     result = re.search(r"(?P<val>[0-9.]+)(?P<unit>[a-zA-Z]+)/s", rate_string)
     if not result:
         print("rate_string:", rate_string)
@@ -319,9 +322,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("-l", "--bwlimit", help="Pass bwlimit value to rsync")
-    # parser.add_argument(
-    #     "-t", "--timeout", help="Timeout to use. If not specified no timeout"
-    # )
     parser.add_argument(
         "--exclude-file", default=None, help="Exclude file for rsync to use"
     )
@@ -356,7 +356,8 @@ def parse_args() -> argparse.Namespace:
 
 @contextlib.contextmanager
 def pty_open() -> Iterator[Ptys]:
-    """Contextmanager to make sure we close the ptys we open"""
+    """Contextmanager to open and then make sure we close the ptys we open"""
+    # Open ptys for stdout, stderr, and stdin
     m_out, s_out = pty.openpty()
     m_err, s_err = pty.openpty()
     m_in, s_in = pty.openpty()
