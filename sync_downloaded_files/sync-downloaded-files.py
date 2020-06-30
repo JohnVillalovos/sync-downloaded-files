@@ -29,6 +29,8 @@ import sys
 import time
 from typing import Iterator, List, NamedTuple, Optional
 
+import attr
+
 
 locale.setlocale(locale.LC_ALL, "en_US.UTF-8")
 
@@ -78,7 +80,7 @@ def execute_rsync(args: argparse.Namespace) -> int:
             print("To: {}".format(dest_path))
             print("Executing: {}".format(" ".join(cmd_list)))
             try:
-                watch_rsync_command(cmd_list, ptys)
+                run_rsync_command(cmd_list, ptys)
             except KeyboardInterrupt:
                 time.sleep(1.25)
                 print("Program terminated with keyboard interrupt.  Exiting...")
@@ -104,21 +106,13 @@ class Ptys(NamedTuple):
     s_in: int
 
 
-def watch_rsync_command(cmd_line: List[str], ptys: Ptys) -> int:
-    fdmap = {ptys.m_out: "stdout", ptys.m_err: "stderr", ptys.m_in: "stdin"}
+def run_rsync_command(cmd_line: List[str], ptys: Ptys) -> int:
     process = subprocess.Popen(
         cmd_line, bufsize=0, stdin=ptys.s_in, stdout=ptys.s_out, stderr=ptys.s_err,
     )
 
-    # If we are currently in the state of having too low of a transfer rate
-    low_rate = False
-    # The last time we had an acceptable rate of download
-    last_acceptable_rate_time = time.time()
-    # Last non-progress line received. This should contain the filename we are
-    # currently transferring
-    last_line = ""
-    # If the last line printed was a progress line or not
-    last_was_progress = False
+    states = States()
+
     # Record the last time we had any activity from rsync as we will terminate
     # it if we think it could have got stuck.
     last_activity = time.time()
@@ -131,55 +125,12 @@ def watch_rsync_command(cmd_line: List[str], ptys: Ptys) -> int:
         ready, _, _ = select.select([ptys.m_out, ptys.m_err], [], [], timeout)
         if ready:
             last_activity = time.time()
-            for fd in ready:
-                data = os.read(fd, 512)
-                if not data:
-                    continue
-                # Convert from bytes to str
-                temp_string = os.fsdecode(data)
-                temp_string = temp_string.strip()
-                for line in temp_string.splitlines():
-                    if not last_was_progress:
-                        print(f"\t{fdmap[fd]}: {line!r}")
-
-                    progress_stats = parse_progress_line(line)
-                    if progress_stats:
-                        if not last_was_progress:
-                            print(last_line)
-                        last_was_progress = True
-                        print(
-                            f"\r"
-                            f"Match!: Rate: {progress_stats.transfer_rate:n} bytes/s, "
-                            f"Bytes Transferred: {progress_stats.bytes_transferred:n}, "
-                            f"Percent Transferred: "
-                            f"{progress_stats.percent_transferred}%, "
-                            f"ETA: {progress_stats.eta}                     ",
-                            end="",
-                        )
-                        if progress_stats.transfer_rate > 100_000:
-                            last_acceptable_rate_time = time.time()
-                            low_rate = False
-                        else:
-                            if not low_rate:
-                                low_rate = True
-                            else:
-                                print(
-                                    "Rate is too low!!! {:2.2f} seconds".format(
-                                        RATE_LOW_TIMEOUT
-                                        - (time.time() - last_acceptable_rate_time)
-                                    )
-                                )
-                                last_was_progress = False
-                                if (
-                                    time.time() - last_acceptable_rate_time
-                                    > RATE_LOW_TIMEOUT
-                                ):
-                                    print("Killing process as rate too low")
-                                    process.terminate()
-                    else:
-                        if line:
-                            last_was_progress = False
-                            last_line = line
+            should_terminate = watch_rsync_progress(
+                process=process, active_fds=ready, states=states
+            )
+            if should_terminate:
+                print("Killing process as rate too low")
+                process.terminate()
         elif process.poll() is not None:
             break  # p exited
         else:
@@ -193,7 +144,111 @@ def watch_rsync_command(cmd_line: List[str], ptys: Ptys) -> int:
                 print("Killing rsync process")
                 process.kill()
 
-    return process.poll()
+    # Note(jlvillal): This is to keep mypy happy.
+    exit_code = process.poll()
+    # This should always be True as we only break out of the while loop if
+    # process.poll() is not None.
+    if exit_code is not None:
+        return exit_code
+    # Realistically we should not get here
+    raise RuntimeError("Unexpectedly got None for process.poll()")
+
+
+@attr.s
+class States:
+    # If we are currently in the state of having too low of a transfer rate
+    low_xfer_rate: bool = False
+    # The last time we had an acceptable rate of download
+    last_acceptable_rate_time: float = time.time()
+    # Last non-progress line received. This should contain the filename we are
+    # currently transferring
+    last_line: str = ""
+    # If the last line printed was a progress line or not
+    last_was_progress: bool = False
+
+
+def watch_rsync_progress(
+    process: subprocess.Popen, active_fds: List[int], states: States
+) -> bool:
+    should_terminate = False
+    for fd in active_fds:
+        data = os.read(fd, 512)
+        if not data:
+            continue
+        # Convert from bytes to str
+        temp_string = os.fsdecode(data)
+        temp_string = temp_string.strip()
+        for line in temp_string.splitlines():
+            if not states.last_was_progress:
+                print(f"\t{line!r}")
+
+            progress_stats = parse_progress_line(line)
+            states.last_was_progress = print_progress(
+                progress_stats=progress_stats,
+                filename=states.last_line,
+                last_was_progress=states.last_was_progress,
+            )
+            if progress_stats:
+                if progress_stats.transfer_rate > 100_000:
+                    states.last_acceptable_rate_time = time.time()
+                    states.low_xfer_rate = False
+                else:
+                    if not states.low_xfer_rate:
+                        states.low_xfer_rate = True
+                    else:
+                        print(
+                            "Rate is too low!!! {:2.2f} seconds".format(
+                                RATE_LOW_TIMEOUT
+                                - (time.time() - states.last_acceptable_rate_time)
+                            )
+                        )
+                        states.last_was_progress = False
+                        if (
+                            time.time() - states.last_acceptable_rate_time
+                            > RATE_LOW_TIMEOUT
+                        ):
+                            should_terminate = True
+            else:
+                if line:
+                    states.last_was_progress = False
+                    states.last_line = line
+    return should_terminate
+
+
+class RsyncProgressStatus(NamedTuple):
+    bytes_transferred: int
+    percent_transferred: float
+    transfer_rate: int
+    eta: str
+
+
+def print_progress(
+    *,
+    progress_stats: Optional[RsyncProgressStatus],
+    filename: str,
+    last_was_progress: bool,
+) -> bool:
+    """
+    Print the progress statistics, if we have them. If our last line printed
+    was not a progress line then print the filename.
+
+    Return: True if we printed the statistics, False otherwise.
+    """
+    if progress_stats:
+        if not last_was_progress:
+            print(filename)
+        print(
+            f"\r"
+            f"Match!: Rate: {progress_stats.transfer_rate:n} bytes/s, "
+            f"Bytes Transferred: {progress_stats.bytes_transferred:n}, "
+            f"Percent Transferred: "
+            f"{progress_stats.percent_transferred}%, "
+            f"ETA: {progress_stats.eta}                     ",
+            end="",
+        )
+        return True
+    else:
+        return False
 
 
 def parse_rate(rate_string: str) -> int:
@@ -294,13 +349,6 @@ def pty_open() -> Iterator[Ptys]:
     finally:
         for fd in m_out, s_out, m_err, s_err, m_in, s_in:
             os.close(fd)
-
-
-class RsyncProgressStatus(NamedTuple):
-    bytes_transferred: int
-    percent_transferred: float
-    transfer_rate: int
-    eta: str
 
 
 def parse_progress_line(line: str) -> Optional[RsyncProgressStatus]:
