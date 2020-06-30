@@ -35,6 +35,7 @@ import attr
 locale.setlocale(locale.LC_ALL, "en_US.UTF-8")
 
 RATE_LOW_TIMEOUT = 30.0
+TRANSFER_RATE_MIN = 100_000
 
 
 def main() -> int:
@@ -44,6 +45,10 @@ def main() -> int:
 
 
 def execute_rsync(args: argparse.Namespace) -> int:
+    """
+    Setup our rsync command line and then execute rsync. If a repeate_time has
+    been given then repeat forever.
+    """
     cmd_list = []
 
     cmd_list.extend(
@@ -72,17 +77,23 @@ def execute_rsync(args: argparse.Namespace) -> int:
     cmd_list.extend(["--exclude", "*.part"])
     cmd_list.extend(["{}:{}".format(args.server, args.server_path), args.dest_dir])
 
+    result = 0
+
+    # Create our ptys for stdout, stderr, and stdin. We have to setup ptys and
+    # use them in the subprocess.Popen() call or rsync will not display the
+    # progress values while running.
     with pty_open() as ptys:
         while True:
             print("Syncing from {}...".format(args.server))
             print("To: {}".format(args.dest_dir))
             print("Executing: {}".format(" ".join(cmd_list)))
             try:
-                run_rsync_command(cmd_list, ptys)
+                result = run_rsync_command(cmd_list, ptys)
             except KeyboardInterrupt:
                 time.sleep(1.25)
                 print("Program terminated with keyboard interrupt.  Exiting...")
-                sys.exit(1)
+                result = 1
+                break
             except subprocess.CalledProcessError:
                 # Ignore errors in call
                 pass
@@ -90,7 +101,7 @@ def execute_rsync(args: argparse.Namespace) -> int:
                 countdown(args.repeat_time)
             else:
                 break
-    return 0
+    return result
 
 
 class Ptys(NamedTuple):
@@ -154,6 +165,8 @@ def run_rsync_command(cmd_line: List[str], ptys: Ptys) -> int:
 
 @attr.s
 class States:
+    """Class used to store our various states that we need to pass back and forth"""
+
     # If we are currently in the state of having too low of a transfer rate
     low_xfer_rate: bool = False
     # The last time we had an acceptable rate of download
@@ -168,6 +181,16 @@ class States:
 def watch_rsync_progress(
     process: subprocess.Popen, active_fds: List[int], states: States
 ) -> bool:
+    """Watch the output from rsync
+
+    In particular we care about the progress lines it gnerates as it gives our
+    current transfer rate. If the transfer rate is too low for longer than our
+    timeout we indicate we should terminate.
+
+    Returns:
+       True, if process should be terminated as transfer rate too low.
+       False, if should not terminate process.
+    """
     should_terminate = False
     for fd in active_fds:
         data = os.read(fd, 512)
@@ -181,13 +204,14 @@ def watch_rsync_progress(
                 print(f"\t{line!r}")
 
             progress_stats = parse_progress_line(line)
-            states.last_was_progress = print_progress(
+            print_progress(
                 progress_stats=progress_stats,
                 filename=states.last_line,
                 last_was_progress=states.last_was_progress,
             )
             if progress_stats:
-                if progress_stats.transfer_rate > 100_000:
+                states.last_was_progress = True
+                if progress_stats.transfer_rate > TRANSFER_RATE_MIN:
                     states.last_acceptable_rate_time = time.time()
                     states.low_xfer_rate = False
                 else:
@@ -210,6 +234,7 @@ def watch_rsync_progress(
                 if line:
                     states.last_was_progress = False
                     states.last_line = line
+
     return should_terminate
 
 
@@ -225,12 +250,10 @@ def print_progress(
     progress_stats: Optional[RsyncProgressStatus],
     filename: str,
     last_was_progress: bool,
-) -> bool:
+) -> None:
     """
     Print the progress statistics, if we have them. If our last line printed
     was not a progress line then print the filename.
-
-    Return: True if we printed the statistics, False otherwise.
     """
     if progress_stats:
         if not last_was_progress:
@@ -244,9 +267,6 @@ def print_progress(
             f"ETA: {progress_stats.eta}                     ",
             end="",
         )
-        return True
-    else:
-        return False
 
 
 def parse_rate(rate_string: str) -> int:
