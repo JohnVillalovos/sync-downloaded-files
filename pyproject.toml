@@ -4,6 +4,9 @@ version = "0.1.0"
 description = ""
 authors = ["John L. Villalovos"]
 
+[tool.poetry.scripts]
+sync-downloaded-files = "sync_downloaded_files.sync_downloaded_files:main"
+
 [tool.poetry.dependencies]
 python = "^3.8"
 attrs =  "^19.3.0"
